@@ -176,22 +176,22 @@ impl ResolvedClassname {
 
     #[inline]
     pub fn get_object_type(&self, codebase: &CodebaseMetadata) -> TAtomic {
-        let mut object_atomic = if let ResolutionOrigin::SpecificClassLikeString(class_string) = &self.origin {
-            class_string.get_object_type(codebase)
-        } else {
-            TAtomic::Object(match self.fqcn {
-                Some(fqcn) => {
-                    let lowercase_fqcn = ascii_lowercase_atom(&fqcn);
+        if let ResolutionOrigin::SpecificClassLikeString(class_string) = &self.origin {
+            return class_string.get_object_type(codebase);
+        }
 
-                    if codebase.symbols.contains_enum(&lowercase_fqcn) {
-                        TObject::Enum(TEnum::new(fqcn))
-                    } else {
-                        TObject::Named(TNamedObject::new(fqcn))
-                    }
+        let mut object_atomic = TAtomic::Object(match self.fqcn {
+            Some(fqcn) => {
+                let lowercase_fqcn = ascii_lowercase_atom(&fqcn);
+
+                if codebase.symbols.contains_enum(&lowercase_fqcn) {
+                    TObject::Enum(TEnum::new(fqcn))
+                } else {
+                    TObject::Named(TNamedObject::new(fqcn))
                 }
-                None => TObject::Any,
-            })
-        };
+            }
+            None => TObject::Any,
+        });
 
         for intersection_class in &self.intersections {
             object_atomic.add_intersection_type(intersection_class.get_object_type(codebase));
@@ -327,10 +327,10 @@ pub fn resolve_classnames_from_expression<'ctx, 'arena>(
         expression => {
             // If the expression is not already analyzed, we analyze it now.
             if !class_is_analyzed {
-                let was_inside_call = block_context.inside_call;
-                block_context.inside_call = true;
+                let was_inside_call = block_context.flags.inside_call();
+                block_context.flags.set_inside_call(true);
                 expression.analyze(context, block_context, artifacts)?;
-                block_context.inside_call = was_inside_call;
+                block_context.flags.set_inside_call(was_inside_call);
             }
 
             let expression_type = artifacts.get_expression_type(expression);

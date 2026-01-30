@@ -382,6 +382,12 @@ fn resolve_method_from_metadata<'ctx, 'arena>(
         StaticClassType::Object(object)
     } else if defining_class_metadata.kind.is_enum() {
         StaticClassType::Object(TObject::Enum(TEnum { name: defining_class_metadata.original_name, case: None }))
+    } else if !classname.intersections.is_empty() {
+        if let TAtomic::Object(object) = classname.get_object_type(context.codebase) {
+            StaticClassType::Object(object)
+        } else {
+            StaticClassType::Name(fq_class_id)
+        }
     } else {
         StaticClassType::Name(fq_class_id)
     };
@@ -459,7 +465,7 @@ fn get_metadata_object<'ctx>(
                 class_like_metadata
                     .template_types
                     .iter()
-                    .map(|(parameter_name, template_map)| {
+                    .map(|(parameter_name, template)| {
                         if let Some(parameter) = get_specialized_template_type(
                             context.codebase,
                             parameter_name,
@@ -469,15 +475,13 @@ fn get_metadata_object<'ctx>(
                         ) {
                             parameter
                         } else {
-                            let (defining_entry, constraint) = unsafe {
-                                // SAFETY: `template_map` is guaranteed to have at least one entry
-                                template_map.iter().next().unwrap_unchecked()
-                            };
+                            let defining_entity = &template.defining_entity;
+                            let constraint = &template.constraint;
 
                             wrap_atomic(TAtomic::GenericParameter(TGenericParameter {
                                 parameter_name: *parameter_name,
                                 constraint: Box::new(constraint.clone()),
-                                defining_entity: *defining_entry,
+                                defining_entity: *defining_entity,
                                 intersection_types: None,
                             }))
                         }

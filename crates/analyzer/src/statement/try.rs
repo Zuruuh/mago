@@ -1,6 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
+use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
 use ahash::HashSetExt;
@@ -15,6 +14,7 @@ use mago_codex::ttype;
 use mago_codex::ttype::atomic::TAtomic;
 use mago_codex::ttype::atomic::object::TObject;
 use mago_codex::ttype::atomic::object::named::TNamedObject;
+use mago_codex::ttype::combiner::CombinerOptions;
 use mago_codex::ttype::union::TUnion;
 use mago_reporting::Annotation;
 use mago_reporting::Issue;
@@ -52,7 +52,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                 true,
             );
 
-            all_catches_leave = all_catches_leave && !actions.contains(&ControlAction::None);
+            all_catches_leave = all_catches_leave && !actions.contains(ControlAction::None);
             catch_actions.push(actions);
         }
 
@@ -61,17 +61,17 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
         let mut try_block_context = block_context.clone();
 
         if self.finally_clause.is_some() {
-            try_block_context.finally_scope = Some(Rc::new(RefCell::new(FinallyScope { locals: BTreeMap::new() })));
+            try_block_context.finally_scope = Some(Rc::new(RefCell::new(FinallyScope::new())));
         }
 
         let assigned_variable_ids = std::mem::take(&mut block_context.assigned_variable_ids);
 
-        let was_inside_try = block_context.inside_try;
-        block_context.inside_try = true;
+        let was_inside_try = block_context.flags.inside_try();
+        block_context.flags.set_inside_try(true);
         analyze_statements(self.block.statements.as_slice(), context, block_context, artifacts)?;
-        block_context.inside_try = was_inside_try;
+        block_context.flags.set_inside_try(was_inside_try);
         if !self.catch_clauses.is_empty() {
-            block_context.has_returned = false;
+            block_context.flags.set_has_returned(false);
         }
 
         let try_block_control_actions = ControlAction::from_statements(
@@ -92,7 +92,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                         occupied_entry.get(),
                         variable_type.as_ref(),
                         context.codebase,
-                        false,
+                        CombinerOptions::default(),
                     );
 
                     occupied_entry.insert(Rc::new(combined_type));
@@ -114,8 +114,12 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
 
             for (variable_id, variable_type) in &block_context.locals {
                 if let Some(existing_type) = mutable_try_scope.locals.get_mut(variable_id) {
-                    let combined_type =
-                        ttype::combine_union_types(existing_type, variable_type.as_ref(), context.codebase, false);
+                    let combined_type = ttype::combine_union_types(
+                        existing_type,
+                        variable_type.as_ref(),
+                        context.codebase,
+                        CombinerOptions::default(),
+                    );
 
                     *existing_type = Rc::new(combined_type);
                 } else {
@@ -130,7 +134,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
         let try_leaves_loop = artifacts
             .loop_scope
             .as_ref()
-            .is_some_and(|loop_scope| !loop_scope.final_actions.contains(&ControlAction::None));
+            .is_some_and(|loop_scope| !loop_scope.final_actions.contains(ControlAction::None));
 
         if all_catches_leave {
             for assigned_variable_id in newly_assigned_variable_ids.keys() {
@@ -147,11 +151,15 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
 
         for (i, catch_clause) in self.catch_clauses.iter().enumerate() {
             let mut catch_block_context = original_block_context.clone();
-            catch_block_context.has_returned = false;
+            catch_block_context.flags.set_has_returned(false);
             for (variable_id, variable_type) in &mut catch_block_context.locals {
                 if let Some(old_type) = old_block_context_locals.get(variable_id) {
-                    *variable_type =
-                        Rc::new(ttype::combine_union_types(variable_type.as_ref(), old_type, context.codebase, false));
+                    *variable_type = Rc::new(ttype::combine_union_types(
+                        variable_type.as_ref(),
+                        old_type,
+                        context.codebase,
+                        CombinerOptions::default(),
+                    ));
                 } else {
                     let mut possibly_undefined_type = (**variable_type).clone();
                     possibly_undefined_type.set_possibly_undefined(variable_type.possibly_undefined(), Some(true));
@@ -222,7 +230,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                 );
             }
 
-            all_catches_leave = catch_actions.iter().all(|actions| !actions.contains(&ControlAction::None));
+            all_catches_leave = catch_actions.iter().all(|actions| !actions.contains(ControlAction::None));
 
             let new_catch_assigned_variables_ids = catch_block_context.assigned_variable_ids.clone();
             catch_block_context.assigned_variable_ids.extend(old_catch_assigned_variable_ids);
@@ -233,9 +241,9 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                 let catch_actions = &catch_actions[i];
 
                 if catch_actions.len() == 1 {
-                    !catch_actions.contains(&ControlAction::End)
-                        && !catch_actions.contains(&ControlAction::Continue)
-                        && !catch_actions.contains(&ControlAction::Break)
+                    !catch_actions.contains(ControlAction::End)
+                        && !catch_actions.contains(ControlAction::Continue)
+                        && !catch_actions.contains(ControlAction::Break)
                 } else {
                     true
                 }
@@ -249,7 +257,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                     .collect();
 
                 let end_action_only =
-                    try_block_control_actions.len() == 1 && try_block_control_actions.contains(&ControlAction::End);
+                    try_block_control_actions.len() == 1 && try_block_control_actions.contains(ControlAction::End);
 
                 for (variable_id, variable_type) in &catch_block_context.locals {
                     if end_action_only {
@@ -261,7 +269,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                                 existing_type.as_ref(),
                                 variable_type.as_ref(),
                                 context.codebase,
-                                false,
+                                CombinerOptions::default(),
                             )),
                         );
                     }
@@ -279,7 +287,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                             finally_variable_type.as_ref(),
                             variable_type.as_ref(),
                             context.codebase,
-                            false,
+                            CombinerOptions::default(),
                         )
                     } else {
                         let mut finally_variable_type = (**variable_type).clone();
@@ -312,7 +320,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
             finally_block_context.assigned_variable_ids = AtomMap::default();
             finally_block_context.possibly_assigned_variable_ids = AtomSet::default();
             finally_block_context.locals = finally_scope.locals;
-            finally_block_context.has_returned = false;
+            finally_block_context.flags.set_has_returned(false);
 
             analyze_statements(
                 finally_clause.block.statements.as_slice(),
@@ -321,7 +329,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                 artifacts,
             )?;
 
-            finally_has_returned = finally_block_context.has_returned;
+            finally_has_returned = finally_block_context.flags.has_returned();
 
             for (variable_id, _) in finally_block_context.assigned_variable_ids {
                 let finally_variable_type = finally_block_context.locals.remove(&variable_id);
@@ -335,7 +343,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                                 existing_type.as_ref(),
                                 finally_variable_type.as_ref(),
                                 context.codebase,
-                                false,
+                                CombinerOptions::default(),
                             );
 
                             if possibly_undefined {
@@ -371,13 +379,13 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
             block_context.possibly_thrown_exceptions.entry(possibly_thrown_exception).or_default().extend(throw_spans);
         }
 
-        block_context.has_returned = if finally_has_returned {
+        block_context.flags.set_has_returned(if finally_has_returned {
             true
-        } else if !try_block_control_actions.contains(&ControlAction::None) {
+        } else if !try_block_control_actions.contains(ControlAction::None) {
             self.catch_clauses.is_empty() || all_catches_leave
         } else {
             false
-        };
+        });
 
         Ok(())
     }

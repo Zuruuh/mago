@@ -7,6 +7,7 @@ use mago_codex::ttype::add_union_type;
 use mago_codex::ttype::atomic::TAtomic;
 use mago_codex::ttype::atomic::callable::TCallable;
 use mago_codex::ttype::cast::cast_atomic_to_callable;
+use mago_codex::ttype::combiner::CombinerOptions;
 use mago_codex::ttype::comparator::ComparisonResult;
 use mago_codex::ttype::comparator::union_comparator::can_expression_types_be_identical;
 use mago_codex::ttype::comparator::union_comparator::is_contained_by;
@@ -89,7 +90,12 @@ pub fn analyze_and_store_argument_type<'ctx, 'arena>(
                 match inferred_parameters.entry(parameter_index) {
                     Entry::Occupied(occupied_entry) => {
                         let existing_type: TUnion = occupied_entry.remove();
-                        let updated_type = add_union_type(existing_type, &parameter_type, context.codebase, false);
+                        let updated_type = add_union_type(
+                            existing_type,
+                            &parameter_type,
+                            context.codebase,
+                            CombinerOptions::default(),
+                        );
 
                         inferred_parameters.insert(parameter_index, updated_type);
                     }
@@ -104,19 +110,19 @@ pub fn analyze_and_store_argument_type<'ctx, 'arena>(
 
     let inferred_parameter_types = std::mem::replace(&mut artifacts.inferred_parameter_types, inferred_parameter_types);
 
-    let was_inside_general_use = block_context.inside_general_use;
-    let was_inside_call = block_context.inside_call;
-    let was_inside_variable_reference = block_context.inside_variable_reference;
+    let was_inside_general_use = block_context.flags.inside_general_use();
+    let was_inside_call = block_context.flags.inside_call();
+    let was_inside_variable_reference = block_context.flags.inside_variable_reference();
 
-    block_context.inside_general_use = true;
-    block_context.inside_call = true;
-    block_context.inside_variable_reference = referenced_parameter;
+    block_context.flags.set_inside_general_use(true);
+    block_context.flags.set_inside_call(true);
+    block_context.flags.set_inside_variable_reference(referenced_parameter);
 
     argument_expression.analyze(context, block_context, artifacts)?;
 
-    block_context.inside_general_use = was_inside_general_use;
-    block_context.inside_call = was_inside_call;
-    block_context.inside_variable_reference = was_inside_variable_reference;
+    block_context.flags.set_inside_general_use(was_inside_general_use);
+    block_context.flags.set_inside_call(was_inside_call);
+    block_context.flags.set_inside_variable_reference(was_inside_variable_reference);
     artifacts.inferred_parameter_types = inferred_parameter_types;
 
     let argument_type = artifacts.get_expression_type(argument_expression).cloned().unwrap_or_else(get_mixed);
@@ -480,6 +486,6 @@ pub fn get_unpacked_argument_type(context: &mut Context<'_, '_>, argument_value_
 
     potential_element_types
         .into_iter()
-        .reduce(|acc, element_type| add_union_type(acc, &element_type, context.codebase, false))
+        .reduce(|acc, element_type| add_union_type(acc, &element_type, context.codebase, CombinerOptions::default()))
         .unwrap_or_else(get_never)
 }

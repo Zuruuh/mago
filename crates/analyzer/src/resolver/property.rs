@@ -1,5 +1,4 @@
 use ahash::HashMap;
-use ahash::RandomState;
 use indexmap::IndexMap;
 
 use mago_atom::Atom;
@@ -80,10 +79,10 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
 ) -> Result<PropertyResolutionResult, AnalysisError> {
     let mut result = PropertyResolutionResult::default();
 
-    let was_inside_general_use = block_context.inside_general_use;
-    block_context.inside_general_use = true;
+    let was_inside_general_use = block_context.flags.inside_general_use();
+    block_context.flags.set_inside_general_use(true);
     object_expression.analyze(context, block_context, artifacts)?;
-    block_context.inside_general_use = was_inside_general_use;
+    block_context.flags.set_inside_general_use(was_inside_general_use);
 
     let selectors = resolve_member_selector(context, block_context, artifacts, property_selector)?;
 
@@ -142,7 +141,7 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
                 result.encountered_mixed = true;
             }
 
-            if !block_context.inside_isset || !object_atomic.is_mixed() {
+            if !block_context.flags.inside_isset() || !object_atomic.is_mixed() {
                 report_access_on_non_object(context, object_atomic, property_selector, object_expression.span());
             }
 
@@ -153,7 +152,7 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
             TObject::Any => {
                 result.has_ambiguous_path = true;
 
-                if !block_context.inside_isset {
+                if !block_context.flags.inside_isset() {
                     report_ambiguous_access(context, property_selector, object_expression.span(), atom("object"));
                 }
 
@@ -177,7 +176,7 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
                     }
                 } else {
                     result.has_ambiguous_path = true;
-                    if !block_context.inside_isset {
+                    if !block_context.flags.inside_isset() {
                         report_ambiguous_access(
                             context,
                             property_selector,
@@ -211,7 +210,7 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
                     }
                 } else {
                     result.has_ambiguous_path = true;
-                    if !block_context.inside_isset {
+                    if !block_context.flags.inside_isset() {
                         report_ambiguous_access(
                             context,
                             property_selector,
@@ -244,7 +243,7 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
 
                         result.has_ambiguous_path = true;
 
-                        if !block_context.inside_isset {
+                        if !block_context.flags.inside_isset() {
                             report_ambiguous_access(
                                 context,
                                 property_selector,
@@ -260,7 +259,7 @@ pub fn resolve_instance_properties<'ctx, 'ast, 'arena>(
                     let mut property_type = value.1.clone();
 
                     if is_optional {
-                        if !block_context.inside_isset {
+                        if !block_context.flags.inside_isset() {
                             report_possibly_non_existent_property(
                                 context,
                                 &object_type,
@@ -594,14 +593,14 @@ pub fn localize_property_type(
 
     inferred_type_replacer::replace(
         class_property_type,
-        &TemplateResult::new(IndexMap::default(), template_types),
+        &TemplateResult::new(Default::default(), template_types),
         context.codebase,
     )
 }
 
 fn update_template_types(
     context: &Context<'_, '_>,
-    template_types: &mut IndexMap<Atom, HashMap<GenericParent, TUnion>, RandomState>,
+    template_types: &mut HashMap<Atom, HashMap<GenericParent, TUnion>>,
     property_class_metadata: &ClassLikeMetadata,
     lhs_type_params: &[TUnion],
     property_declaring_class_metadata: &ClassLikeMetadata,
@@ -647,7 +646,7 @@ fn update_template_types(
                         .template_types
                         .iter()
                         .enumerate()
-                        .filter(|(_, (k, _))| k == parameter_name)
+                        .filter(|(_, (k, _))| *k == parameter_name)
                         .map(|(i, _)| i)
                         .next();
 
@@ -712,8 +711,8 @@ fn report_access_on_null<'ctx>(
             );
         }
         (false, false) => {
-            if !block_context.inside_isset {
-                if block_context.inside_assignment {
+            if !block_context.flags.inside_isset() {
+                if block_context.flags.inside_assignment() {
                     context.collector.report_with_code(
                         IssueCode::PossiblyNullPropertyAccess,
                         Issue::error("Attempting to access a property on a possibly `null` value.")

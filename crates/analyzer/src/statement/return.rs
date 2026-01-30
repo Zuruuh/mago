@@ -8,6 +8,7 @@ use mago_codex::metadata::property::PropertyMetadata;
 use mago_codex::metadata::property_hook::PropertyHookMetadata;
 use mago_codex::ttype::TType;
 use mago_codex::ttype::combine_union_types;
+use mago_codex::ttype::combiner::CombinerOptions;
 use mago_codex::ttype::comparator::ComparisonResult;
 use mago_codex::ttype::comparator::union_comparator::is_contained_by;
 use mago_codex::ttype::expander::StaticClassType;
@@ -43,9 +44,9 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Return<'arena> {
         artifacts: &mut AnalysisArtifacts,
     ) -> Result<(), AnalysisError> {
         let inferred_return_type = if let Some(return_value) = self.value.as_ref() {
-            block_context.inside_return = true;
+            block_context.flags.set_inside_return(true);
             return_value.analyze(context, block_context, artifacts)?;
-            block_context.inside_return = false;
+            block_context.flags.set_inside_return(false);
 
             let inferred_return_type = artifacts.get_rc_expression_type(&return_value).cloned();
 
@@ -116,18 +117,19 @@ pub fn handle_return_value<'ctx>(
         let mut finally_scope = (*finally_scope).borrow_mut();
         for (var_id, var_type) in &block_context.locals {
             if let Some(finally_type) = finally_scope.locals.get_mut(var_id) {
-                *finally_type = Rc::new(combine_union_types(finally_type, var_type, context.codebase, false));
+                *finally_type =
+                    Rc::new(combine_union_types(finally_type, var_type, context.codebase, CombinerOptions::default()));
             } else {
                 finally_scope.locals.insert(*var_id, var_type.clone());
             }
         }
     }
 
-    block_context.has_returned = true;
+    block_context.flags.set_has_returned(true);
     block_context.control_actions.insert(ControlAction::Return);
 
     // Check for uninitialized properties when returning from a constructor
-    if block_context.collect_initializations
+    if block_context.flags.collect_initializations()
         && let Some(FunctionLikeIdentifier::Method(class_name, method_name)) =
             block_context.scope.get_function_like_identifier()
         && method_name.eq_ignore_ascii_case("__construct")
@@ -770,8 +772,12 @@ fn get_generator_return_type(context: &Context, return_type: &TUnion) -> Option<
 
         match generator_return.as_mut() {
             Some(existing_return) => {
-                *existing_return =
-                    combine_union_types(existing_return, &generator_parameters.3, context.codebase, false);
+                *existing_return = combine_union_types(
+                    existing_return,
+                    &generator_parameters.3,
+                    context.codebase,
+                    CombinerOptions::default(),
+                );
             }
             None => {
                 generator_return = Some(generator_parameters.3);

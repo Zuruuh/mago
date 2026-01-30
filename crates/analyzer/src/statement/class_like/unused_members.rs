@@ -84,6 +84,12 @@ pub fn check_unused_members_with_transitivity<'ctx, 'arena>(
             continue;
         }
 
+        if !property.read_visibility.is_private()
+            && class_like_metadata.overridden_property_ids.contains_key(property_name)
+        {
+            continue;
+        }
+
         if let Some(property_span) = property.name_span.or(property.span) {
             checkable_members.push(CheckableMember {
                 symbol_id: (class_name, *property_name),
@@ -125,6 +131,15 @@ pub fn check_unused_members_with_transitivity<'ctx, 'arena>(
         }
 
         if class_like_metadata.overridden_method_ids.contains_key(method_name) {
+            continue;
+        }
+
+        if class_like_metadata
+            .used_traits
+            .iter()
+            .any(|trait_name| context.codebase.method_exists(trait_name, method_name))
+        {
+            // non-abstract trait method override, could be used in the trait itself.
             continue;
         }
 

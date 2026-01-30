@@ -58,21 +58,21 @@ pub(crate) fn analyze<'ctx, 'arena>(
         array_target_expressions.last().unwrap_unchecked().get_array()
     };
 
-    let was_inside_general_use = block_context.inside_general_use;
-    block_context.inside_general_use = true;
+    let was_inside_general_use = block_context.flags.inside_general_use();
+    block_context.flags.set_inside_general_use(true);
     root_array_expression.analyze(context, block_context, artifacts)?;
-    block_context.inside_general_use = was_inside_general_use;
+    block_context.flags.set_inside_general_use(was_inside_general_use);
 
     let mut root_array_type = artifacts.get_expression_type(root_array_expression).cloned().unwrap_or_else(get_mixed);
 
     if root_array_type.is_mixed() {
-        let was_inside_general_use = block_context.inside_general_use;
-        block_context.inside_general_use = true;
+        let was_inside_general_use = block_context.flags.inside_general_use();
+        block_context.flags.set_inside_general_use(true);
         array_target.get_array().analyze(context, block_context, artifacts)?;
         if let Some(index) = array_target.get_index() {
             index.analyze(context, block_context, artifacts)?;
         }
-        block_context.inside_general_use = was_inside_general_use;
+        block_context.flags.set_inside_general_use(was_inside_general_use);
     }
 
     let mut current_type = root_array_type.clone();
@@ -200,7 +200,8 @@ fn update_atomic_given_key(
             return atomic_type;
         };
 
-        let combined_value_type = add_union_type(array_value_type, current_type, context.codebase, false);
+        let combined_value_type =
+            add_union_type(array_value_type, current_type, context.codebase, context.settings.combiner_options());
 
         if array.is_empty() && key_type.is_none() {
             *array = TArray::List(TList {
@@ -224,7 +225,7 @@ fn update_atomic_given_key(
                             array_key_type,
                             &key_type.as_ref().map_or_else(get_int, |rc| (**rc).clone()),
                             context.codebase,
-                            false,
+                            context.settings.combiner_options(),
                         )),
                         Box::new(combined_value_type),
                     ));
@@ -381,15 +382,18 @@ fn update_array_assignment_child_type<'ctx>(
             match original_type {
                 TAtomic::Array(array) => match array {
                     TArray::List(list) => {
-                        if !block_context.inside_loop && list.element_type.is_never() {
+                        // Track individual array elements outside loops when element_type is never,
+                        // but only up to the threshold to prevent memory explosion on files with
+                        // thousands of array pushes.
+                        let current_known_count = list.known_elements.as_ref().map_or(0, BTreeMap::len);
+                        if !block_context.flags.inside_loop()
+                            && list.element_type.is_never()
+                            && current_known_count < context.settings.array_combination_threshold as usize
+                        {
                             collection_types.push(TAtomic::Array(TArray::List(TList {
                                 element_type: Box::new(get_never()),
                                 known_elements: Some(BTreeMap::from([(
-                                    if let Some(known_elements) = list.known_elements.as_ref() {
-                                        known_elements.len()
-                                    } else {
-                                        0
-                                    },
+                                    current_known_count,
                                     (false, value_type.clone()),
                                 )])),
                                 known_count: None,
@@ -462,9 +466,15 @@ fn update_array_assignment_child_type<'ctx>(
         return root_type;
     }
 
-    let collection_type = TUnion::from_vec(combiner::combine(collection_types, context.codebase, false));
+    let collection_type =
+        TUnion::from_vec(combiner::combine(collection_types, context.codebase, context.settings.combiner_options()));
 
-    add_union_type(root_type, &collection_type, context.codebase, true)
+    add_union_type(
+        root_type,
+        &collection_type,
+        context.codebase,
+        context.settings.combiner_options().with_overwrite_empty_array(),
+    )
 }
 
 pub(crate) fn analyze_nested_array_assignment<'ctx, 'ast, 'arena>(
@@ -488,10 +498,10 @@ pub(crate) fn analyze_nested_array_assignment<'ctx, 'ast, 'arena>(
         let mut array_target_index_type = None;
 
         if let Some(index) = array_target.get_index() {
-            let was_inside_general_use = block_context.inside_general_use;
-            block_context.inside_general_use = true;
+            let was_inside_general_use = block_context.flags.inside_general_use();
+            block_context.flags.set_inside_general_use(true);
             index.analyze(context, block_context, artifacts)?;
-            block_context.inside_general_use = was_inside_general_use;
+            block_context.flags.set_inside_general_use(was_inside_general_use);
             let index_type = artifacts.get_rc_expression_type(&index).cloned();
 
             array_target_index_type =
@@ -521,7 +531,7 @@ pub(crate) fn analyze_nested_array_assignment<'ctx, 'ast, 'arena>(
             return Ok(array_target.get_index());
         };
 
-        if array_expression_type.is_never() && !block_context.inside_loop {
+        if array_expression_type.is_never() && !block_context.flags.inside_loop() {
             let atomic = wrap_atomic(TAtomic::Array(TArray::Keyed(TKeyedArray {
                 known_items: None,
                 parameters: None,
@@ -542,7 +552,7 @@ pub(crate) fn analyze_nested_array_assignment<'ctx, 'ast, 'arena>(
 
         let is_last = i == array_target_expressions.len() - 1;
 
-        block_context.inside_assignment = true;
+        block_context.flags.set_inside_assignment(true);
 
         let mut array_expr_type = get_array_target_type_given_index(
             context,
@@ -558,7 +568,7 @@ pub(crate) fn analyze_nested_array_assignment<'ctx, 'ast, 'arena>(
             false,
         );
 
-        block_context.inside_assignment = false;
+        block_context.flags.set_inside_assignment(false);
         let array_expression_type_inner = (*array_expression_type).clone();
 
         if is_last {

@@ -24,9 +24,11 @@ use mago_codex::ttype::atomic::array::list::TList;
 use mago_codex::ttype::atomic::generic::TGenericParameter;
 use mago_codex::ttype::atomic::object::TObject;
 use mago_codex::ttype::atomic::scalar::TScalar;
+use mago_codex::ttype::combiner::CombinerOptions;
 use mago_codex::ttype::expander;
 use mago_codex::ttype::expander::StaticClassType;
 use mago_codex::ttype::expander::TypeExpansionOptions;
+use mago_codex::ttype::get_arraykey;
 use mago_codex::ttype::get_iterable_value_parameter;
 use mago_codex::ttype::get_mixed;
 use mago_codex::ttype::get_mixed_maybe_from_loop;
@@ -96,7 +98,7 @@ pub fn reconcile_keyed_types<'ctx>(
         }
     }
 
-    let inside_loop = block_context.inside_loop;
+    let inside_loop = block_context.flags.inside_loop();
     let old_new_types = new_types.clone();
     let mut new_types = new_types.clone();
 
@@ -343,6 +345,21 @@ fn adjust_array_type(
                     }
                 }
             }
+            TAtomic::Mixed(_) => {
+                let key = if has_string_offset {
+                    ArrayKey::String(atom(&arraykey_offset))
+                } else if let Ok(arraykey_value) = arraykey_offset.parse::<i64>() {
+                    ArrayKey::Integer(arraykey_value)
+                } else {
+                    continue;
+                };
+
+                *base_atomic_type = TAtomic::Array(TArray::Keyed(TKeyedArray {
+                    known_items: Some(BTreeMap::from([(key, (false, result_type.clone()))])),
+                    parameters: Some((Box::new(get_arraykey()), Box::new(get_mixed()))),
+                    non_empty: true,
+                }));
+            }
             _ => {
                 continue;
             }
@@ -563,11 +580,7 @@ fn add_nested_assertions(
                             }
                         }
                     } else {
-                        entry.push(vec![if array_key.contains('\'') {
-                            Assertion::HasStringArrayAccess
-                        } else {
-                            Assertion::HasIntOrStringArrayAccess
-                        }]);
+                        entry.push(vec![Assertion::HasIntOrStringArrayAccess]);
                     }
 
                     base_key = new_base_key;
@@ -633,12 +646,24 @@ pub fn break_up_path_into_parts(path: &str) -> Vec<String> {
             let mut token_found: Option<&'static str> = None;
             match c {
                 '[' => {
+                    if brackets == 0 {
+                        token_found = Some("[");
+                    } else {
+                        unsafe {
+                            parts.last_mut().unwrap_unchecked().push(c);
+                        }
+                    }
                     brackets += 1;
-                    token_found = Some("[");
                 }
                 ']' => {
                     brackets -= 1;
-                    token_found = Some("]");
+                    if brackets == 0 {
+                        token_found = Some("]");
+                    } else {
+                        unsafe {
+                            parts.last_mut().unwrap_unchecked().push(c);
+                        }
+                    }
                 }
                 '\'' | '"' => {
                     string_char = Some(c);
@@ -743,7 +768,7 @@ fn get_value_for_key(
     };
 
     let base_key_atom = atom(&base_key);
-    if let std::collections::btree_map::Entry::Vacant(e) = block_context.locals.entry(base_key_atom) {
+    if let std::collections::hash_map::Entry::Vacant(e) = block_context.locals.entry(base_key_atom) {
         if base_key.contains("::") {
             let base_key_parts = &base_key.split("::").collect::<Vec<&str>>();
             let fq_class_name = &base_key_parts[0];
@@ -850,8 +875,12 @@ fn get_value_for_key(
                                 && new_assertions.contains_key(&new_base_key_atom)
                             {
                                 if has_inverted_isset && new_base_key_atom == key {
-                                    new_base_type_candidate =
-                                        add_union_type(new_base_type_candidate, &get_null(), context.codebase, false);
+                                    new_base_type_candidate = add_union_type(
+                                        new_base_type_candidate,
+                                        &get_null(),
+                                        context.codebase,
+                                        CombinerOptions::default(),
+                                    );
                                 }
 
                                 new_base_type_candidate.set_possibly_undefined(true, None);
@@ -884,8 +913,12 @@ fn get_value_for_key(
                                 && new_assertions.contains_key(&new_base_key_atom)
                             {
                                 if has_inverted_isset && new_base_key_atom == key {
-                                    new_base_type_candidate =
-                                        add_union_type(new_base_type_candidate, &get_null(), context.codebase, false);
+                                    new_base_type_candidate = add_union_type(
+                                        new_base_type_candidate,
+                                        &get_null(),
+                                        context.codebase,
+                                        CombinerOptions::default(),
+                                    );
                                 }
 
                                 new_base_type_candidate.set_possibly_undefined(true, None);
@@ -909,7 +942,12 @@ fn get_value_for_key(
                     }
 
                     let resulting_type = Rc::new(if let Some(new_base_type) = &new_base_type {
-                        add_union_type(new_base_type_candidate, new_base_type, context.codebase, false)
+                        add_union_type(
+                            new_base_type_candidate,
+                            new_base_type,
+                            context.codebase,
+                            CombinerOptions::default(),
+                        )
                     } else {
                         new_base_type_candidate.clone()
                     });

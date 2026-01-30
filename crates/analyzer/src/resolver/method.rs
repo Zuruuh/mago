@@ -17,6 +17,7 @@ use mago_codex::ttype::comparator::union_comparator::is_contained_by;
 use mago_codex::ttype::expander::StaticClassType;
 use mago_codex::ttype::get_mixed;
 use mago_codex::ttype::get_specialized_template_type;
+use mago_codex::ttype::template::GenericTemplate;
 use mago_codex::ttype::template::TemplateResult;
 use mago_codex::ttype::union::TUnion;
 use mago_reporting::Annotation;
@@ -103,10 +104,10 @@ pub fn resolve_method_targets<'ctx, 'ast, 'arena>(
 ) -> Result<MethodResolutionResult, AnalysisError> {
     let mut result = MethodResolutionResult::default();
 
-    let was_inside_general_use = block_context.inside_general_use;
-    block_context.inside_general_use = true;
+    let was_inside_general_use = block_context.flags.inside_general_use();
+    block_context.flags.set_inside_general_use(true);
     object.analyze(context, block_context, artifacts)?;
-    block_context.inside_general_use = was_inside_general_use;
+    block_context.flags.set_inside_general_use(was_inside_general_use);
 
     let resolved_selectors = resolve_member_selector(context, block_context, artifacts, selector)?;
     let mut method_names = Vec::new();
@@ -329,7 +330,7 @@ pub fn resolve_method_from_object<'ctx, 'ast, 'arena>(
                 .template_types
                 .entry(template_name)
                 .or_default()
-                .push((GenericParent::ClassLike(metadata.name), parameter.clone()));
+                .push(GenericTemplate::new(GenericParent::ClassLike(metadata.name), parameter.clone()));
         }
 
         resolved_methods.push(ResolvedMethod {
