@@ -34,6 +34,23 @@ pub struct SourceConfiguration {
     #[serde(default)]
     pub includes: Vec<String>,
 
+    /// Paths or glob patterns for PHP stub files whose phpdocs should patch existing definitions.
+    ///
+    /// Supports both directory paths and glob patterns (same as `paths`).
+    ///
+    /// Defaults to `[]`.
+    #[serde(default)]
+    pub stub_files: Vec<String>,
+
+    /// File suffixes to load when a `stub-files` entry points to a directory.
+    ///
+    /// Unlike `extensions`, these are matched against the full file name suffix,
+    /// so values like `.stub` and `.phpstub` are both supported.
+    ///
+    /// Defaults to `[".stub"]`.
+    #[serde(default = "default_stub_file_extensions")]
+    pub stub_files_extensions: Vec<String>,
+
     /// Patterns to exclude from the scan.
     ///
     /// Defaults to `[]`.
@@ -62,6 +79,8 @@ impl SourceConfiguration {
             workspace,
             paths: vec![],
             includes: vec![],
+            stub_files: vec![],
+            stub_files_extensions: default_stub_file_extensions(),
             excludes: vec![],
             extensions: vec![PHP_EXTENSION.to_string()],
         }
@@ -82,4 +101,8 @@ impl SourceConfiguration {
 
 fn default_extensions() -> Vec<String> {
     vec![PHP_EXTENSION.to_string()]
+}
+
+fn default_stub_file_extensions() -> Vec<String> {
+    vec![".stub".to_string()]
 }

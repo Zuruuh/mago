@@ -31,3 +31,8 @@ indicatif = { workspace = true }
 rayon = { workspace = true }
 bumpalo = { workspace = true }
 xxhash-rust = { workspace = true }
+glob = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

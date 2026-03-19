@@ -3,6 +3,8 @@
 //! This module defines [`OrchestratorConfiguration`], which aggregates all settings
 //! needed by the orchestrator and its various services.
 
+use std::path::Path;
+
 use mago_analyzer::settings::Settings as AnalyzerSettings;
 use mago_formatter::settings::FormatSettings;
 use mago_guard::settings::Settings as GuardSettings;
@@ -32,6 +34,9 @@ pub struct OrchestratorConfiguration<'a> {
     /// and disjunctive normal form types.
     pub php_version: PHPVersion,
 
+    /// The workspace root used for source discovery and path resolution.
+    pub workspace: &'a Path,
+
     /// Paths or glob patterns for source files to analyze.
     ///
     /// These are the primary targets for linting, formatting, and analysis. If empty,
@@ -58,6 +63,19 @@ pub struct OrchestratorConfiguration<'a> {
     ///
     /// Supports both directory paths and glob patterns (same as `paths`).
     pub includes: Vec<String>,
+
+    /// PHPStan-style stub files whose phpdocs should patch existing definitions.
+    ///
+    /// These files are loaded as context only, like `includes`, but are treated specially
+    /// by the analyzer pipeline: only docblock-derived metadata is applied, and existing
+    /// definitions are patched rather than replaced.
+    pub stub_files: Vec<String>,
+
+    /// File suffixes to load when a `stub_files` entry points at a directory.
+    ///
+    /// These suffixes are matched against the full file name, so values such as
+    /// `.stub` and `.phpstub` are both valid.
+    pub stub_file_extensions: Vec<&'a str>,
 
     /// Glob patterns or paths to exclude from file scanning.
     ///

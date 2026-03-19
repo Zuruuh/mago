@@ -28,7 +28,9 @@ use crate::metadata::constant::ConstantMetadata;
 use crate::metadata::enum_case::EnumCaseMetadata;
 use crate::metadata::flags::MetadataFlags;
 use crate::metadata::function_like::FunctionLikeMetadata;
+use crate::metadata::parameter::FunctionLikeParameterMetadata;
 use crate::metadata::property::PropertyMetadata;
+use crate::metadata::property_hook::PropertyHookMetadata;
 use crate::metadata::ttype::TypeMetadata;
 use crate::reference::SymbolReferences;
 use crate::signature::FileSignature;
@@ -1058,6 +1060,61 @@ impl CodebaseMetadata {
         self.infer_types_from_usage |= other.infer_types_from_usage;
     }
 
+    /// Marks all entries in this metadata as originating from a stub file.
+    pub fn mark_as_stub(&mut self) {
+        for metadata in self.class_likes.values_mut() {
+            metadata.flags |= MetadataFlags::STUB;
+        }
+
+        for metadata in self.function_likes.values_mut() {
+            metadata.flags |= MetadataFlags::STUB;
+        }
+
+        for metadata in self.constants.values_mut() {
+            metadata.flags |= MetadataFlags::STUB;
+        }
+    }
+
+    /// Applies docblock-only information from stub metadata onto existing definitions.
+    ///
+    /// This mirrors PHPStan-style `stubFiles`: stubs may augment existing symbols,
+    /// but they must not replace the original definitions, spans, or native signatures.
+    pub fn apply_stub_metadata(&mut self, stub_metadata: CodebaseMetadata) {
+        for (name, stub_class_like) in stub_metadata.class_likes {
+            let Some(existing_class_like) = self.class_likes.get_mut(&name) else {
+                continue;
+            };
+
+            apply_stub_class_like(existing_class_like, stub_class_like);
+        }
+
+        for (identifier, stub_function_like) in stub_metadata.function_likes {
+            match self.function_likes.entry(identifier) {
+                Entry::Occupied(mut entry) => {
+                    apply_stub_function_like(entry.get_mut(), stub_function_like);
+                }
+                Entry::Vacant(entry) => {
+                    if identifier.0.is_empty() || !self.class_likes.contains_key(&identifier.0) {
+                        continue;
+                    }
+
+                    entry.insert(stub_function_like);
+                }
+            }
+        }
+
+        for (name, stub_constant) in stub_metadata.constants {
+            let Some(existing_constant) = self.constants.get_mut(&name) else {
+                continue;
+            };
+
+            apply_stub_constant(existing_constant, stub_constant);
+        }
+
+        self.infer_types_from_usage |= stub_metadata.infer_types_from_usage;
+        self.file_signatures.extend(stub_metadata.file_signatures);
+    }
+
     /// Removes all entries that were contributed by the given per-file scan metadata.
     ///
     /// This is the inverse of [`extend_ref()`]: it removes class_likes, function_likes,
@@ -1208,4 +1265,357 @@ fn should_replace_metadata(
     }
 
     new_span < existing_span
+}
+
+fn apply_stub_class_like(existing: &mut ClassLikeMetadata, stub: ClassLikeMetadata) {
+    existing.flags = merge_selected_flags(existing.flags, stub.flags, class_like_stub_flag_mask());
+    existing.issues.extend(stub.issues);
+
+    if let Some(has_sealed_methods) = stub.has_sealed_methods {
+        existing.has_sealed_methods = Some(has_sealed_methods);
+    }
+
+    if let Some(has_sealed_properties) = stub.has_sealed_properties {
+        existing.has_sealed_properties = Some(has_sealed_properties);
+    }
+
+    if let Some(permitted_inheritors) = stub.permitted_inheritors {
+        existing.permitted_inheritors.get_or_insert_default().extend(permitted_inheritors);
+    }
+
+    if !stub.template_types.is_empty() {
+        existing.template_types.extend(stub.template_types);
+    }
+
+    existing.template_readonly.extend(stub.template_readonly);
+    existing.template_variance.extend(stub.template_variance);
+    existing.template_extended_offsets.extend(stub.template_extended_offsets);
+    existing.template_extended_parameters.extend(stub.template_extended_parameters);
+    existing.template_type_extends_count.extend(stub.template_type_extends_count);
+    existing.template_type_implements_count.extend(stub.template_type_implements_count);
+    existing.template_type_uses_count.extend(stub.template_type_uses_count);
+    existing.require_extends.extend(stub.require_extends);
+    existing.require_implements.extend(stub.require_implements);
+    existing.type_aliases.extend(stub.type_aliases);
+    existing.imported_type_aliases.extend(stub.imported_type_aliases);
+    existing.mixins.extend(stub.mixins);
+
+    for (method_name, method_id) in stub.appearing_method_ids {
+        existing.methods.insert(method_name);
+        existing.appearing_method_ids.insert(method_name, method_id);
+    }
+
+    for (method_name, method_id) in stub.declaring_method_ids {
+        existing.methods.insert(method_name);
+        existing.declaring_method_ids.insert(method_name, method_id);
+    }
+
+    for (method_name, method_id) in stub.inheritable_method_ids {
+        existing.methods.insert(method_name);
+        existing.inheritable_method_ids.insert(method_name, method_id);
+    }
+
+    for method_name in stub.pseudo_methods {
+        existing.methods.insert(method_name);
+        existing.pseudo_methods.insert(method_name);
+    }
+
+    existing.static_pseudo_methods.extend(stub.static_pseudo_methods);
+
+    for (property_name, stub_property) in stub.properties {
+        match existing.properties.entry(property_name) {
+            Entry::Occupied(mut entry) => {
+                apply_stub_property(entry.get_mut(), stub_property);
+            }
+            Entry::Vacant(entry) => {
+                if stub_property.flags.is_magic_property() {
+                    entry.insert(stub_property);
+                    existing.appearing_property_ids.insert(property_name, existing.name);
+                    existing.declaring_property_ids.insert(property_name, existing.name);
+                }
+            }
+        }
+    }
+
+    for (constant_name, stub_constant) in stub.constants {
+        let Some(existing_constant) = existing.constants.get_mut(&constant_name) else {
+            continue;
+        };
+
+        apply_stub_class_like_constant(existing_constant, stub_constant);
+    }
+}
+
+fn apply_stub_function_like(existing: &mut FunctionLikeMetadata, stub: FunctionLikeMetadata) {
+    existing.flags = merge_selected_flags(existing.flags, stub.flags, function_like_stub_flag_mask());
+    existing.issues.extend(stub.issues);
+    existing.has_docblock |= stub.has_docblock;
+
+    if let Some(stub_return_type) = stub.return_type_metadata
+        && stub_return_type.from_docblock
+    {
+        existing.return_type_metadata = Some(stub_return_type);
+    }
+
+    if !stub.template_types.is_empty() {
+        existing.template_types = stub.template_types;
+    }
+
+    if !stub.thrown_types.is_empty() {
+        existing.thrown_types = stub.thrown_types;
+    }
+
+    if !stub.assertions.is_empty() {
+        existing.assertions = stub.assertions;
+    }
+
+    if !stub.if_true_assertions.is_empty() {
+        existing.if_true_assertions = stub.if_true_assertions;
+    }
+
+    if !stub.if_false_assertions.is_empty() {
+        existing.if_false_assertions = stub.if_false_assertions;
+    }
+
+    if let (Some(existing_method_metadata), Some(stub_method_metadata)) =
+        (existing.method_metadata.as_mut(), stub.method_metadata)
+        && !stub_method_metadata.where_constraints.is_empty()
+    {
+        existing_method_metadata.where_constraints = stub_method_metadata.where_constraints;
+    }
+
+    for stub_parameter in stub.parameters {
+        let Some(existing_parameter) = existing.get_parameter_mut(stub_parameter.name.0) else {
+            continue;
+        };
+
+        apply_stub_parameter(existing_parameter, stub_parameter);
+    }
+}
+
+fn apply_stub_parameter(existing: &mut FunctionLikeParameterMetadata, stub: FunctionLikeParameterMetadata) {
+    if let Some(type_metadata) = stub.type_metadata
+        && type_metadata.from_docblock
+    {
+        existing.type_metadata = Some(type_metadata);
+    }
+
+    if let Some(out_type) = stub.out_type {
+        existing.out_type = Some(out_type);
+    }
+}
+
+fn apply_stub_property(existing: &mut PropertyMetadata, stub: PropertyMetadata) {
+    existing.flags = merge_selected_flags(existing.flags, stub.flags, property_stub_flag_mask());
+
+    if let Some(type_metadata) = stub.type_metadata
+        && type_metadata.from_docblock
+    {
+        existing.type_metadata = Some(type_metadata);
+    }
+
+    for (hook_name, stub_hook) in stub.hooks {
+        match existing.hooks.entry(hook_name) {
+            Entry::Occupied(mut entry) => {
+                apply_stub_property_hook(entry.get_mut(), stub_hook);
+            }
+            Entry::Vacant(entry) => {
+                if stub_hook.has_docblock {
+                    entry.insert(stub_hook);
+                }
+            }
+        }
+    }
+}
+
+fn apply_stub_property_hook(existing: &mut PropertyHookMetadata, stub: PropertyHookMetadata) {
+    existing.flags = merge_selected_flags(existing.flags, stub.flags, property_hook_stub_flag_mask());
+    existing.issues.extend(stub.issues);
+    existing.has_docblock |= stub.has_docblock;
+
+    if let Some(return_type_metadata) = stub.return_type_metadata
+        && return_type_metadata.from_docblock
+    {
+        existing.return_type_metadata = Some(return_type_metadata);
+    }
+
+    if let (Some(existing_parameter), Some(stub_parameter)) = (existing.parameter.as_mut(), stub.parameter) {
+        apply_stub_parameter(existing_parameter, stub_parameter);
+    }
+}
+
+fn apply_stub_constant(existing: &mut ConstantMetadata, stub: ConstantMetadata) {
+    existing.flags = merge_selected_flags(existing.flags, stub.flags, constant_stub_flag_mask());
+    existing.issues.extend(stub.issues);
+
+    if let Some(type_metadata) = stub.type_metadata
+        && type_metadata.from_docblock
+    {
+        existing.type_metadata = Some(type_metadata);
+    }
+}
+
+fn apply_stub_class_like_constant(existing: &mut ClassLikeConstantMetadata, stub: ClassLikeConstantMetadata) {
+    existing.flags = merge_selected_flags(existing.flags, stub.flags, constant_stub_flag_mask());
+
+    if let Some(type_metadata) = stub.type_metadata
+        && type_metadata.from_docblock
+    {
+        existing.type_metadata = Some(type_metadata);
+    }
+}
+
+fn merge_selected_flags(existing: MetadataFlags, new: MetadataFlags, mask: MetadataFlags) -> MetadataFlags {
+    (existing & !mask) | (new & mask)
+}
+
+fn class_like_stub_flag_mask() -> MetadataFlags {
+    MetadataFlags::FINAL
+        | MetadataFlags::DEPRECATED
+        | MetadataFlags::INTERNAL
+        | MetadataFlags::ENUM_INTERFACE
+        | MetadataFlags::CONSISTENT_CONSTRUCTOR
+        | MetadataFlags::CONSISTENT_TEMPLATES
+        | MetadataFlags::UNCHECKED
+        | MetadataFlags::API
+}
+
+fn function_like_stub_flag_mask() -> MetadataFlags {
+    MetadataFlags::DEPRECATED
+        | MetadataFlags::INTERNAL
+        | MetadataFlags::UNCHECKED
+        | MetadataFlags::MUST_USE
+        | MetadataFlags::PURE
+        | MetadataFlags::MUTATION_FREE
+        | MetadataFlags::EXTERNAL_MUTATION_FREE
+        | MetadataFlags::IGNORE_NULLABLE_RETURN
+        | MetadataFlags::IGNORE_FALSABLE_RETURN
+        | MetadataFlags::INHERITS_DOCS
+        | MetadataFlags::NO_NAMED_ARGUMENTS
+}
+
+fn property_stub_flag_mask() -> MetadataFlags {
+    MetadataFlags::DEPRECATED | MetadataFlags::INTERNAL | MetadataFlags::READONLY
+}
+
+fn property_hook_stub_flag_mask() -> MetadataFlags {
+    MetadataFlags::DEPRECATED | MetadataFlags::INTERNAL
+}
+
+fn constant_stub_flag_mask() -> MetadataFlags {
+    MetadataFlags::DEPRECATED | MetadataFlags::INTERNAL | MetadataFlags::FINAL
+}
+
+#[cfg(test)]
+mod tests {
+    use bumpalo::Bump;
+    use mago_database::file::File;
+    use mago_names::resolver::NameResolver;
+    use mago_syntax::parser::parse_file;
+
+    use crate::scanner::scan_program;
+    use crate::ttype::TType;
+
+    use super::*;
+
+    fn scan_php(source: &str) -> CodebaseMetadata {
+        let arena = Bump::new();
+        let file = File::ephemeral("test.php".into(), source.to_string().into());
+        let program = parse_file(&arena, &file);
+        let resolved_names = NameResolver::new(&arena).resolve(program);
+
+        scan_program(&arena, &file, program, &resolved_names)
+    }
+
+    #[test]
+    fn stub_function_docblocks_patch_without_replacing_definition() {
+        let mut codebase =
+            scan_php("<?php\nclass Foo {\n    public function bar(string $value): int { return 1; }\n}\n");
+        let mut stub = scan_php(
+            "<?php\nclass Foo {\n    /**\n     * @param non-empty-string $value\n     * @return positive-int\n     */\n    public function bar(int $value): string {}\n}\n",
+        );
+        stub.mark_as_stub();
+
+        let original_span = codebase.get_method("Foo", "bar").unwrap().span;
+        let original_decl = codebase
+            .get_method("Foo", "bar")
+            .unwrap()
+            .return_type_declaration_metadata
+            .as_ref()
+            .unwrap()
+            .type_union
+            .get_id();
+
+        codebase.apply_stub_metadata(stub);
+
+        let method = codebase.get_method("Foo", "bar").unwrap();
+        assert_eq!(method.span, original_span);
+        assert_eq!(method.return_type_declaration_metadata.as_ref().unwrap().type_union.get_id(), original_decl);
+        assert_eq!(method.return_type_metadata.as_ref().unwrap().type_union.get_id(), "positive-int");
+        assert!(method.return_type_metadata.as_ref().unwrap().from_docblock);
+
+        let parameter = method.parameters.first().unwrap();
+        assert_eq!(parameter.type_declaration_metadata.as_ref().unwrap().type_union.get_id(), "string");
+        assert_eq!(parameter.type_metadata.as_ref().unwrap().type_union.get_id(), "non-empty-string");
+        assert!(parameter.type_metadata.as_ref().unwrap().from_docblock);
+    }
+
+    #[test]
+    fn stub_magic_members_patch_existing_class_without_replacing_it() {
+        let mut codebase = scan_php("<?php\nclass Foo {}\n");
+        let mut stub = scan_php(
+            "<?php\n/**\n * @method positive-int magic()\n * @property non-empty-string $name\n */\nclass Foo {}\n",
+        );
+        stub.mark_as_stub();
+
+        let original_span = codebase.get_class("Foo").unwrap().span;
+
+        codebase.apply_stub_metadata(stub);
+
+        let class_like = codebase.get_class("Foo").unwrap();
+        assert_eq!(class_like.span, original_span);
+        assert!(class_like.pseudo_methods.contains(&atom("magic")));
+
+        let magic_method = codebase.get_method("Foo", "magic").unwrap();
+        assert!(magic_method.flags.is_magic_method());
+        assert_eq!(magic_method.return_type_metadata.as_ref().unwrap().type_union.get_id(), "positive-int");
+
+        let magic_property = codebase.get_property("Foo", "$name").unwrap();
+        assert!(magic_property.flags.is_magic_property());
+        assert_eq!(magic_property.type_metadata.as_ref().unwrap().type_union.get_id(), "non-empty-string");
+    }
+
+    #[test]
+    fn stub_declared_methods_patch_existing_class_like_method_tables() {
+        let mut codebase = scan_php("<?php\ninterface DateTimeInterface {}\n");
+        let mut stub = scan_php(
+            "<?php\ninterface DateTimeInterface {\n    /** @return $this */\n    public function modify(string $modifier): static;\n}\n",
+        );
+        stub.mark_as_stub();
+
+        codebase.apply_stub_metadata(stub);
+
+        assert!(codebase.method_exists("DateTimeInterface", "modify"));
+        let method = codebase.get_method("DateTimeInterface", "modify").unwrap();
+        assert!(method.return_type_metadata.as_ref().unwrap().from_docblock);
+        assert!(method.return_type_declaration_metadata.is_some());
+    }
+
+    #[test]
+    fn stub_class_constants_patch_existing_constants_without_replacing_them() {
+        let mut codebase = scan_php("<?php\nclass Foo {\n    public const BAR = 1;\n}\n");
+        let mut stub =
+            scan_php("<?php\nclass Foo {\n    /** @var positive-int */\n    public final const BAR = 1;\n}\n");
+        stub.mark_as_stub();
+
+        let original_span = codebase.get_class_constant("Foo", "BAR").unwrap().span;
+
+        codebase.apply_stub_metadata(stub);
+
+        let constant = codebase.get_class_constant("Foo", "BAR").unwrap();
+        assert_eq!(constant.span, original_span);
+        assert!(constant.flags.is_final());
+        assert_eq!(constant.type_metadata.as_ref().unwrap().type_union.get_id(), "positive-int");
+        assert!(constant.type_metadata.as_ref().unwrap().from_docblock);
+    }
 }
