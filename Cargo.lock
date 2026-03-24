@@ -1568,6 +1568,7 @@ version = "1.15.3"
 dependencies = [
  "bumpalo",
  "foldhash 0.2.0",
+ "glob",
  "indicatif",
  "mago-analyzer",
  "mago-atom",
@@ -1582,7 +1583,9 @@ dependencies = [
  "mago-semantics",
  "mago-syntax",
  "rayon",
+ "tempfile",
  "tracing",
+ "walkdir",
  "xxhash-rust",
 ]
 

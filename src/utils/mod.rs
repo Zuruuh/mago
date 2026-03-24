@@ -81,6 +81,7 @@ pub(crate) fn create_orchestrator<'a>(
 
     let orchestrator_config = OrchestratorConfiguration {
         php_version: configuration.php_version,
+        workspace: configuration.source.workspace.as_path(),
         parser_settings: configuration.parser.to_settings(),
         analyzer_settings: configuration.analyzer.to_settings(configuration.php_version, color_choice, enable_diff),
         linter_settings,
@@ -94,6 +95,8 @@ pub(crate) fn create_orchestrator<'a>(
         excludes: configuration.source.excludes.iter().map(|p| p.as_ref()).collect(),
         extensions: configuration.source.extensions.iter().map(|e| e.as_ref()).collect(),
         includes: configuration.source.includes.clone(),
+        stub_files: configuration.source.stub_files.clone(),
+        stub_file_extensions: configuration.source.stub_files_extensions.iter().map(|e| e.as_ref()).collect(),
     };
 
     Orchestrator::new(orchestrator_config)

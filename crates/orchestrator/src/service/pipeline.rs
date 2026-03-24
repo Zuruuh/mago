@@ -80,6 +80,7 @@ pub struct ParallelPipeline<T, I, R> {
     parser_settings: ParserSettings,
     reducer: Box<dyn Reducer<I, R> + Send + Sync>,
     should_use_progress_bar: bool,
+    stub_file_ids: HashSet<FileId>,
 }
 
 impl<T, I, R> std::fmt::Debug for ParallelPipeline<T, I, R>
@@ -96,6 +97,7 @@ where
             .field("parser_settings", &self.parser_settings)
             .field("reducer", &"<reducer>")
             .field("should_use_progress_bar", &self.should_use_progress_bar)
+            .field("stub_file_ids", &self.stub_file_ids)
             .finish()
     }
 }
@@ -129,6 +131,7 @@ where
         parser_settings: ParserSettings,
         reducer: Box<dyn Reducer<I, R> + Send + Sync>,
         should_use_progress_bar: bool,
+        stub_file_ids: HashSet<FileId>,
     ) -> Self {
         Self {
             task_name,
@@ -139,6 +142,7 @@ where
             parser_settings,
             reducer,
             should_use_progress_bar,
+            stub_file_ids,
         }
     }
 
@@ -192,6 +196,9 @@ where
                 let file_signature = signature_builder::build_file_signature(&file, program, &resolved_names);
 
                 let mut metadata = scan_program(arena, &file, program, &resolved_names);
+                if self.stub_file_ids.contains(&file.id) {
+                    metadata.mark_as_stub();
+                }
                 metadata.set_file_signature(file.id, file_signature);
 
                 arena.reset();
@@ -204,8 +211,20 @@ where
             .collect();
 
         let mut merged_codex = self.codebase;
+        let mut stub_partials = Vec::new();
         for partial in partial_codebases? {
-            merged_codex.extend(partial);
+            let is_stub =
+                partial.file_signatures.keys().next().is_some_and(|file_id| self.stub_file_ids.contains(file_id));
+
+            if is_stub {
+                stub_partials.push(partial);
+            } else {
+                merged_codex.extend(partial);
+            }
+        }
+
+        for partial in stub_partials {
+            merged_codex.apply_stub_metadata(partial);
         }
 
         let mut symbol_references = self.symbol_references;

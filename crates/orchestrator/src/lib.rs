@@ -39,16 +39,22 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use bumpalo::Bump;
+use foldhash::HashSet;
+use glob::glob;
+use glob::Pattern;
 use mago_analyzer::plugin::PluginRegistry;
 use mago_analyzer::plugin::create_registry_with_plugins;
 use mago_codex::metadata::CodebaseMetadata;
 use mago_codex::reference::SymbolReferences;
 use mago_database::Database;
 use mago_database::DatabaseConfiguration;
+use mago_database::DatabaseReader;
 use mago_database::ReadDatabase;
 use mago_database::exclusion::Exclusion;
 use mago_database::file::File;
+use mago_database::file::FileId;
 use mago_database::loader::DatabaseLoader;
+use walkdir::WalkDir;
 
 use crate::service::analysis::AnalysisService;
 use crate::service::format::FileFormatStatus;
@@ -64,6 +70,125 @@ pub mod config;
 pub mod error;
 pub mod progress;
 pub mod service;
+
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{')
+}
+
+fn normalize_match_path(path: &str) -> String {
+    path.trim_start_matches("./").trim_start_matches(".\\").replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn file_name_matches_stub_extension(path: &Path, stub_file_extensions: &[&str]) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    stub_file_extensions.iter().any(|extension| {
+        if extension.starts_with('.') {
+            file_name.ends_with(extension)
+        } else {
+            file_name.ends_with(&format!(".{extension}"))
+        }
+    })
+}
+
+#[derive(Debug, Default)]
+struct StubFileMatcher {
+    exact_names: HashSet<String>,
+    exact_paths: Vec<PathBuf>,
+    directory_names: Vec<String>,
+    directory_paths: Vec<PathBuf>,
+    glob_patterns: Vec<Pattern>,
+}
+
+impl StubFileMatcher {
+    fn from_config(workspace: &Path, stub_files: &[String]) -> Self {
+        let mut matcher = Self::default();
+
+        for stub_file in stub_files {
+            if is_glob_pattern(stub_file) {
+                let pattern_source =
+                    if Path::new(stub_file).is_absolute() { stub_file.clone() } else { normalize_match_path(stub_file) };
+                if let Ok(pattern) = Pattern::new(&pattern_source) {
+                    matcher.glob_patterns.push(pattern);
+                }
+
+                continue;
+            }
+
+            let absolute_path = if Path::new(stub_file).is_absolute() {
+                PathBuf::from(stub_file)
+            } else {
+                workspace.join(stub_file)
+            };
+            let normalized_name = normalize_match_path(stub_file);
+
+            if absolute_path.is_dir() {
+                matcher.directory_names.push(normalized_name);
+                matcher.directory_paths.push(absolute_path.canonicalize().unwrap_or(absolute_path));
+                continue;
+            }
+
+            matcher.exact_names.insert(normalized_name);
+            matcher.exact_paths.push(absolute_path.canonicalize().unwrap_or(absolute_path));
+        }
+
+        matcher
+    }
+
+    fn matches_file(&self, file: &File) -> bool {
+        let normalized_name = normalize_match_path(file.name.as_ref());
+
+        if self.exact_names.contains(&normalized_name) {
+            return true;
+        }
+
+        if self
+            .directory_names
+            .iter()
+            .any(|directory| normalized_name == *directory || normalized_name.starts_with(&format!("{directory}/")))
+        {
+            return true;
+        }
+
+        if self.glob_patterns.iter().any(|pattern| pattern.matches(&normalized_name)) {
+            return true;
+        }
+
+        let Some(path) = file.path.as_deref() else {
+            return false;
+        };
+
+        if self.exact_paths.iter().any(|exact_path| exact_path == path) {
+            return true;
+        }
+
+        if self.directory_paths.iter().any(|directory| path.starts_with(directory)) {
+            return true;
+        }
+
+        let Some(path_str) = path.to_str() else {
+            return false;
+        };
+
+        self.glob_patterns.iter().any(|pattern| pattern.matches(path_str))
+    }
+}
+
+pub(crate) fn resolve_stub_file_ids(database: &ReadDatabase, workspace: &Path, stub_files: &[String]) -> HashSet<FileId> {
+    if stub_files.is_empty() {
+        return HashSet::default();
+    }
+
+    let matcher = StubFileMatcher::from_config(workspace, stub_files);
+
+    database
+        .files()
+        .filter(|file| matcher.matches_file(file))
+        .map(|file| file.id)
+        .collect()
+}
 
 /// The main orchestrator for running operations on PHP code.
 ///
@@ -196,6 +321,59 @@ impl<'a> Orchestrator<'a> {
                 .collect()
         }
 
+        fn load_stub_files_into_database(
+            database: &mut Database<'_>,
+            workspace: &Path,
+            stub_files: &[String],
+            stub_file_extensions: &[&str],
+        ) -> Result<(), OrchestratorError> {
+            for stub_file in stub_files {
+                if is_glob_pattern(stub_file) {
+                    let pattern = if Path::new(stub_file).is_absolute() {
+                        stub_file.clone()
+                    } else {
+                        workspace.join(stub_file).to_string_lossy().into_owned()
+                    };
+
+                    for entry in glob(&pattern).map_err(|error| OrchestratorError::General(error.to_string()))? {
+                        let path = entry.map_err(|error| OrchestratorError::General(error.to_string()))?;
+                        if !path.is_file() {
+                            continue;
+                        }
+
+                        database.add(File::read(workspace, &path, mago_database::file::FileType::Vendored)?);
+                    }
+
+                    continue;
+                }
+
+                let path = if Path::new(stub_file).is_absolute() {
+                    PathBuf::from(stub_file)
+                } else {
+                    workspace.join(stub_file)
+                };
+
+                if path.is_dir() {
+                    for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
+                        let stub_path = entry.path();
+                        if !stub_path.is_file() || !file_name_matches_stub_extension(stub_path, stub_file_extensions) {
+                            continue;
+                        }
+
+                        database.add(File::read(workspace, stub_path, mago_database::file::FileType::Vendored)?);
+                    }
+
+                    continue;
+                }
+
+                if path.is_file() {
+                    database.add(File::read(workspace, &path, mago_database::file::FileType::Vendored)?);
+                }
+            }
+
+            Ok(())
+        }
+
         let includes = if include_externals {
             self.config.includes.iter().map(|s| Cow::Borrowed(s.as_ref())).collect::<Vec<Cow<'a, str>>>()
         } else {
@@ -216,7 +394,15 @@ impl<'a> Orchestrator<'a> {
             loader = loader.with_database(prelude_db);
         }
 
-        let result = loader.load().map_err(OrchestratorError::Database)?;
+        let mut result = loader.load().map_err(OrchestratorError::Database)?;
+        if include_externals && !self.config.stub_files.is_empty() {
+            load_stub_files_into_database(
+                &mut result,
+                workspace,
+                &self.config.stub_files,
+                &self.config.stub_file_extensions,
+            )?;
+        }
 
         Ok(result)
     }
@@ -295,6 +481,9 @@ impl<'a> Orchestrator<'a> {
             self.config.parser_settings,
             self.config.use_progress_bars,
             self.get_analyzer_plugin_registry(),
+            self.config.workspace.to_path_buf(),
+            self.config.stub_files.clone(),
+            self.config.stub_file_extensions.iter().map(|extension| (*extension).to_string()).collect(),
         )
     }
 
@@ -326,6 +515,9 @@ impl<'a> Orchestrator<'a> {
             self.config.analyzer_settings.clone(),
             self.config.parser_settings,
             self.get_analyzer_plugin_registry(),
+            self.config.workspace.to_path_buf(),
+            self.config.stub_files.clone(),
+            self.config.stub_file_extensions.iter().map(|extension| (*extension).to_string()).collect(),
         )
     }
 
@@ -403,9 +595,76 @@ impl<'a> Orchestrator<'a> {
     /// Using this method with a reused arena (resetting it between calls) is significantly
     /// more efficient than calling [`format_file`](Self::format_file) repeatedly, as it
     /// avoids repeated allocator initialization.
-    pub fn format_file_in(&self, file: &File, arena: &Bump) -> Result<FileFormatStatus, OrchestratorError> {
+pub fn format_file_in(&self, file: &File, arena: &Bump) -> Result<FileFormatStatus, OrchestratorError> {
         let service = self.get_format_service(ReadDatabase::empty());
 
         service.format_file_in(file, arena)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use mago_analyzer::settings::Settings as AnalyzerSettings;
+    use mago_formatter::settings::FormatSettings;
+    use mago_guard::settings::Settings as GuardSettings;
+    use mago_linter::settings::Settings as LinterSettings;
+    use mago_php_version::PHPVersion;
+    use mago_syntax::settings::ParserSettings;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn test_config<'a>() -> OrchestratorConfiguration<'a> {
+        OrchestratorConfiguration {
+            php_version: PHPVersion::PHP84,
+            workspace: Path::new("/test"),
+            paths: vec!["src".to_string()],
+            includes: vec![],
+            stub_files: vec!["stubs".to_string()],
+            stub_file_extensions: vec![".phpstub"],
+            excludes: vec![],
+            extensions: vec!["php"],
+            parser_settings: ParserSettings::default(),
+            analyzer_settings: AnalyzerSettings::default(),
+            linter_settings: LinterSettings::default(),
+            guard_settings: GuardSettings::default(),
+            formatter_settings: FormatSettings::default(),
+            disable_default_analyzer_plugins: false,
+            analyzer_plugins: vec![],
+            use_progress_bars: false,
+            use_colors: false,
+        }
+    }
+
+    #[test]
+    fn directory_stub_files_load_using_stub_file_extensions() {
+        let workspace = TempDir::new().expect("temp dir should be created");
+        fs::create_dir_all(workspace.path().join("src")).expect("src dir should be created");
+        fs::create_dir_all(workspace.path().join("stubs/nested")).expect("stubs dir should be created");
+        fs::write(workspace.path().join("src/main.php"), "<?php\nclass Foo {}\n").expect("main file should be written");
+        fs::write(workspace.path().join("stubs/Foo.phpstub"), "<?php\nclass Foo {}\n")
+            .expect("stub file should be written");
+        fs::write(workspace.path().join("stubs/nested/ignored.php"), "<?php\nclass Ignored {}\n")
+            .expect("non-stub file should be written");
+
+        let orchestrator = Orchestrator::new(test_config());
+        let database = orchestrator
+            .load_database(workspace.path(), true, None)
+            .expect("database should load with directory stubs");
+
+        assert!(database.files().any(|file| file.name.as_ref() == "stubs/Foo.phpstub"));
+        assert!(!database.files().any(|file| file.name.as_ref() == "stubs/nested/ignored.php"));
+
+        let stub_file_ids = resolve_stub_file_ids(&database.read_only(), workspace.path(), &["stubs".to_string()]);
+        let foo_stub_id = database
+            .files()
+            .find(|file| file.name.as_ref() == "stubs/Foo.phpstub")
+            .map(|file| file.id)
+            .expect("stub file should be present");
+
+        assert!(stub_file_ids.contains(&foo_stub_id));
     }
 }

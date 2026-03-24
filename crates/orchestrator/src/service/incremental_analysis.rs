@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -32,6 +33,7 @@ use mago_syntax::settings::ParserSettings;
 use rayon::prelude::*;
 
 use crate::error::OrchestratorError;
+use crate::resolve_stub_file_ids;
 
 /// Per-file cached state for incremental analysis.
 #[derive(Debug, Clone)]
@@ -68,6 +70,9 @@ pub struct IncrementalAnalysisService {
     plugin_registry: Arc<PluginRegistry>,
     initialized: bool,
     codebase_issues: IssueCollection,
+    stub_files: Vec<String>,
+    stub_file_ids: HashSet<FileId>,
+    workspace: PathBuf,
 }
 
 impl std::fmt::Debug for IncrementalAnalysisService {
@@ -79,11 +84,64 @@ impl std::fmt::Debug for IncrementalAnalysisService {
             .field("file_states", &format!("{} tracked files", self.file_states.len()))
             .field("initialized", &self.initialized)
             .field("codebase_issues", &self.codebase_issues.len())
+            .field("stub_files", &self.stub_files)
+            .field("stub_file_ids", &self.stub_file_ids)
+            .field("workspace", &self.workspace)
             .finish()
     }
 }
 
 impl IncrementalAnalysisService {
+    fn collect_stub_overlays_for_changed_definitions(
+        &self,
+        stub_file_ids: &HashSet<FileId>,
+        changed_file_scans: &[(FileId, CodebaseMetadata)],
+    ) -> Vec<CodebaseMetadata> {
+        if stub_file_ids.is_empty() || changed_file_scans.is_empty() {
+            return Vec::new();
+        }
+
+        let changed_class_like_names: AtomSet =
+            changed_file_scans.iter().flat_map(|(_, metadata)| metadata.class_likes.keys().copied()).collect();
+        let changed_function_like_ids: HashSet<(mago_atom::Atom, mago_atom::Atom)> =
+            changed_file_scans.iter().flat_map(|(_, metadata)| metadata.function_likes.keys().copied()).collect();
+        let changed_constant_names: AtomSet =
+            changed_file_scans.iter().flat_map(|(_, metadata)| metadata.constants.keys().copied()).collect();
+
+        if changed_class_like_names.is_empty() && changed_function_like_ids.is_empty() && changed_constant_names.is_empty() {
+            return Vec::new();
+        }
+
+        let parser_settings = self.parser_settings;
+
+        self.database
+            .files()
+            .filter(|file| stub_file_ids.contains(&file.id))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map_init(Bump::new, |arena, file| {
+                let program = parse_file_with_settings(arena, &file, parser_settings);
+                let resolved_names = NameResolver::new(arena).resolve(program);
+                let mut metadata = scan_program(arena, &file, program, &resolved_names);
+                metadata.class_likes.retain(|name, _| changed_class_like_names.contains(name));
+                metadata
+                    .function_likes
+                    .retain(|identifier, _| changed_function_like_ids.contains(identifier) || changed_class_like_names.contains(&identifier.0));
+                metadata.constants.retain(|name, _| changed_constant_names.contains(name));
+                metadata.file_signatures.clear();
+
+                if metadata.class_likes.is_empty() && metadata.function_likes.is_empty() && metadata.constants.is_empty() {
+                    arena.reset();
+                    return None;
+                }
+
+                arena.reset();
+                Some(metadata)
+            })
+            .filter_map(std::convert::identity)
+            .collect()
+    }
+
     /// Creates a new incremental analysis service with the given database, base codebase, and settings.
     ///
     /// The provided `codebase` and `symbol_references` should contain only prelude/builtin
@@ -105,9 +163,13 @@ impl IncrementalAnalysisService {
         settings: Settings,
         parser_settings: ParserSettings,
         plugin_registry: Arc<PluginRegistry>,
+        workspace: PathBuf,
+        stub_files: Vec<String>,
+        _stub_file_extensions: Vec<String>,
     ) -> Self {
         let base_codebase = Arc::new(codebase.clone());
         let base_symbol_references = Arc::new(symbol_references.clone());
+        let stub_file_ids = resolve_stub_file_ids(&database, &workspace, &stub_files);
 
         Self {
             database,
@@ -121,6 +183,9 @@ impl IncrementalAnalysisService {
             plugin_registry,
             initialized: false,
             codebase_issues: IssueCollection::default(),
+            stub_files,
+            stub_file_ids,
+            workspace,
         }
     }
 
@@ -236,6 +301,7 @@ impl IncrementalAnalysisService {
     /// After this call, [`analyze_incremental()`](Self::analyze_incremental) can be used
     /// for subsequent runs.
     pub fn analyze(&mut self) -> Result<AnalysisResult, OrchestratorError> {
+        let current_stub_file_ids = resolve_stub_file_ids(&self.database, &self.workspace, &self.stub_files);
         let source_files: Vec<_> = self.database.files().filter(|f| f.file_type != FileType::Builtin).collect();
 
         if source_files.is_empty() {
@@ -264,6 +330,9 @@ impl IncrementalAnalysisService {
 
                 let file_signature = signature_builder::build_file_signature(&file, program, &resolved_names);
                 let mut metadata = scan_program(arena, &file, program, &resolved_names);
+                if current_stub_file_ids.contains(&file.id) {
+                    metadata.mark_as_stub();
+                }
                 metadata.set_file_signature(file.id, file_signature);
 
                 arena.reset();
@@ -277,7 +346,11 @@ impl IncrementalAnalysisService {
 
         for (file_id, content_hash, metadata) in per_file_results {
             let entry_keys = metadata.extract_keys();
-            merged_codebase.extend(metadata);
+            if current_stub_file_ids.contains(&file_id) {
+                merged_codebase.apply_stub_metadata(metadata);
+            } else {
+                merged_codebase.extend(metadata);
+            }
             file_states.insert(
                 file_id,
                 FileState {
@@ -319,6 +392,7 @@ impl IncrementalAnalysisService {
         self.codebase = merged_codebase;
         self.symbol_references = std::mem::take(&mut analysis_result.symbol_references);
         self.initialized = true;
+        self.stub_file_ids = current_stub_file_ids;
 
         Ok(analysis_result)
     }
@@ -341,6 +415,8 @@ impl IncrementalAnalysisService {
     ) -> Result<AnalysisResult, OrchestratorError> {
         assert!(self.initialized, "analyze() must be called before analyze_incremental()");
 
+        let current_stub_file_ids = resolve_stub_file_ids(&self.database, &self.workspace, &self.stub_files);
+
         let source_files: Vec<_> = self.database.files().filter(|f| f.file_type != FileType::Builtin).collect();
 
         if source_files.is_empty() {
@@ -355,6 +431,7 @@ impl IncrementalAnalysisService {
         // Detect deleted files (present in cache but no longer in database)
         let current_file_ids: HashSet<FileId> = source_files.iter().map(|f| f.id).collect();
         let deleted_count = self.file_states.keys().filter(|id| !current_file_ids.contains(id)).count();
+        let deleted_stub = self.stub_file_ids.iter().any(|id| !current_file_ids.contains(id));
         if deleted_count > 0 {
             tracing::debug!("{} file(s) deleted since last run", deleted_count);
         }
@@ -422,6 +499,14 @@ impl IncrementalAnalysisService {
             return Ok(result);
         }
 
+        let stub_files_changed = deleted_stub
+            || changed_files.iter().any(|file| current_stub_file_ids.contains(&file.id))
+            || current_stub_file_ids.iter().any(|id| !self.stub_file_ids.contains(id));
+        if stub_files_changed {
+            tracing::debug!("Stub files changed, falling back to full analysis");
+            return self.analyze();
+        }
+
         let parser_settings = self.parser_settings;
         let new_file_scans: Vec<(FileId, CodebaseMetadata)> = changed_files
             .into_par_iter()
@@ -449,6 +534,7 @@ impl IncrementalAnalysisService {
                 (file.id, metadata)
             })
             .collect();
+        let stub_overlays = self.collect_stub_overlays_for_changed_definitions(&current_stub_file_ids, &new_file_scans);
 
         let mut diff = {
             let mut diff = CodebaseDiff::new();
@@ -504,6 +590,9 @@ impl IncrementalAnalysisService {
             }
             for (_file_id, new_metadata) in &new_file_scans {
                 merged_codebase.extend_ref(new_metadata);
+            }
+            for stub_overlay in stub_overlays.iter().cloned() {
+                merged_codebase.apply_stub_metadata(stub_overlay);
             }
 
             let files_to_skip: HashSet<FileId> = unchanged_file_ids.iter().copied().collect();
@@ -615,6 +704,9 @@ impl IncrementalAnalysisService {
         }
         for (_file_id, new_metadata) in &new_file_scans {
             merged_codebase.extend_ref(new_metadata);
+        }
+        for stub_overlay in stub_overlays {
+            merged_codebase.apply_stub_metadata(stub_overlay);
         }
 
         merged_codebase.safe_symbols.clear();
@@ -958,6 +1050,23 @@ mod tests {
             Settings::default(),
             ParserSettings::default(),
             Arc::clone(&PLUGIN_REGISTRY),
+            Path::new("/test").to_path_buf(),
+            vec![],
+            vec![".stub".to_string()],
+        )
+    }
+
+    fn make_service_with_stubs(db: &Database<'_>, stub_files: Vec<String>) -> IncrementalAnalysisService {
+        IncrementalAnalysisService::new(
+            db.read_only(),
+            CodebaseMetadata::new(),
+            SymbolReferences::new(),
+            Settings::default(),
+            ParserSettings::default(),
+            Arc::clone(&PLUGIN_REGISTRY),
+            Path::new("/test").to_path_buf(),
+            stub_files,
+            vec![".stub".to_string(), ".phpstub".to_string()],
         )
     }
 
@@ -1008,6 +1117,62 @@ mod tests {
         let incremental = service.analyze_incremental(None).expect("Incremental analysis failed.");
 
         assert_eq!(initial.issues.len(), incremental.issues.len());
+    }
+
+    #[test]
+    fn test_incremental_reapplies_stub_overlays_after_augmented_file_changes() {
+        let config = DatabaseConfiguration {
+            workspace: Cow::Owned(Path::new("/test").to_path_buf()),
+            paths: vec![Cow::Borrowed("src")],
+            includes: vec![Cow::Borrowed("stubs")],
+            excludes: vec![],
+            extensions: vec![Cow::Borrowed("php")],
+        };
+
+        let mut db = Database::new(config);
+        db.add(File::new(
+            Cow::Borrowed("src/Foo.php"),
+            FileType::Host,
+            None,
+            Cow::Borrowed(
+                "<?php\nclass Foo {\n    public function __call(string $name, array $arguments): mixed { return 1; }\n}\n",
+            ),
+        ));
+        db.add(File::new(
+            Cow::Borrowed("src/main.php"),
+            FileType::Host,
+            None,
+            Cow::Borrowed("<?php\nfunction demo(Foo $foo): int {\n    return $foo->magic();\n}\n"),
+        ));
+        db.add(File::new(
+            Cow::Borrowed("stubs/Foo.phpstub"),
+            FileType::Vendored,
+            None,
+            Cow::Borrowed("<?php\n/** @method int magic() */\nclass Foo {}\n"),
+        ));
+
+        let mut service = make_service_with_stubs(&db, vec!["stubs/Foo.phpstub".to_string()]);
+        let initial = service.analyze().expect("Initial analysis failed.");
+        assert!(initial.issues.is_empty(), "stub overlay should suppress the missing-method issue");
+
+        db.update(
+            FileId::new("src/Foo.php"),
+            Cow::Owned(
+                "<?php\nclass Foo {\n    public function __call(string $name, array $arguments): mixed { return 2; }\n}\n".to_string(),
+            ),
+        );
+        service.update_database(db.read_only());
+        let incremental = service.analyze_incremental(None).expect("Incremental analysis failed.");
+
+        let mut fresh_service = make_service_with_stubs(&db, vec!["stubs/Foo.phpstub".to_string()]);
+        let full = fresh_service.analyze().expect("Full analysis failed.");
+
+        let (only_incr, only_full) = diff_issues(&incremental.issues, &full.issues);
+        assert!(
+            only_incr.is_empty() && only_full.is_empty(),
+            "Stub overlays should be reapplied after augmented file edits.\n  Only in incremental: {only_incr:?}\n  Only in full: {only_full:?}"
+        );
+        assert!(incremental.issues.is_empty(), "stub-patched method should remain visible after the edit");
     }
 
     #[test]
@@ -1904,6 +2069,9 @@ mod tests {
             settings,
             ParserSettings::default(),
             Arc::clone(&PLUGIN_REGISTRY),
+            Path::new("/test").to_path_buf(),
+            vec![],
+            vec![".stub".to_string()],
         )
     }
 

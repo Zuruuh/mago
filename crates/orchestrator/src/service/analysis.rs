@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -25,6 +26,7 @@ use mago_syntax::parser::parse_file_with_settings;
 use mago_syntax::settings::ParserSettings;
 
 use crate::error::OrchestratorError;
+use crate::resolve_stub_file_ids;
 use crate::service::pipeline::ParallelPipeline;
 use crate::service::pipeline::Reducer;
 
@@ -36,6 +38,8 @@ pub struct AnalysisService {
     parser_settings: ParserSettings,
     use_progress_bars: bool,
     plugin_registry: Arc<PluginRegistry>,
+    stub_files: Vec<String>,
+    workspace: PathBuf,
 }
 
 impl std::fmt::Debug for AnalysisService {
@@ -48,6 +52,8 @@ impl std::fmt::Debug for AnalysisService {
             .field("parser_settings", &self.parser_settings)
             .field("use_progress_bars", &self.use_progress_bars)
             .field("plugin_registry", &self.plugin_registry)
+            .field("stub_files", &self.stub_files)
+            .field("workspace", &self.workspace)
             .finish()
     }
 }
@@ -62,8 +68,21 @@ impl AnalysisService {
         parser_settings: ParserSettings,
         use_progress_bars: bool,
         plugin_registry: Arc<PluginRegistry>,
+        workspace: PathBuf,
+        stub_files: Vec<String>,
+        _stub_file_extensions: Vec<String>,
     ) -> Self {
-        Self { database, codebase, symbol_references, settings, parser_settings, use_progress_bars, plugin_registry }
+        Self {
+            database,
+            codebase,
+            symbol_references,
+            settings,
+            parser_settings,
+            use_progress_bars,
+            plugin_registry,
+            stub_files,
+            workspace,
+        }
     }
 
     /// Analyzes a single file synchronously without using parallel processing.
@@ -105,6 +124,15 @@ impl AnalysisService {
         let semantics_checker = SemanticsChecker::new(self.settings.version);
         issues.extend(semantics_checker.check(file, program, &resolved_names));
 
+        let stub_file_ids = resolve_stub_file_ids(&self.database, &self.workspace, &self.stub_files);
+        self.codebase = build_codebase_with_stubs(
+            &self.database,
+            std::mem::take(&mut self.codebase),
+            stub_file_ids,
+            self.parser_settings,
+            Some(file_id),
+        );
+
         let user_codebase = scan_program(&arena, file, program, &resolved_names);
         self.codebase.extend(user_codebase);
 
@@ -131,6 +159,7 @@ impl AnalysisService {
         #[cfg(not(target_arch = "wasm32"))]
         const ANALYSIS_DURATION_THRESHOLD: Duration = Duration::from_millis(5000);
         const ANALYSIS_PROGRESS_PREFIX: &str = "🔬 Analyzing";
+        let stub_file_ids = resolve_stub_file_ids(&self.database, &self.workspace, &self.stub_files);
 
         let pipeline = ParallelPipeline::new(
             ANALYSIS_PROGRESS_PREFIX,
@@ -141,6 +170,7 @@ impl AnalysisService {
             self.parser_settings,
             Box::new(AnalysisResultReducer),
             self.use_progress_bars,
+            stub_file_ids,
         );
 
         let plugin_registry = Arc::clone(&self.plugin_registry);
@@ -176,6 +206,41 @@ impl AnalysisService {
     }
 }
 
+fn build_codebase_with_stubs(
+    database: &ReadDatabase,
+    mut codebase: CodebaseMetadata,
+    stub_file_ids: HashSet<FileId>,
+    parser_settings: ParserSettings,
+    skip_file_id: Option<FileId>,
+) -> CodebaseMetadata {
+    for file in database.files() {
+        if file.file_type.is_builtin() || stub_file_ids.contains(&file.id) || skip_file_id == Some(file.id) {
+            continue;
+        }
+
+        let arena = Bump::new();
+        let program = parse_file_with_settings(&arena, &file, parser_settings);
+        let resolved_names = NameResolver::new(&arena).resolve(program);
+        let metadata = scan_program(&arena, &file, program, &resolved_names);
+        codebase.extend(metadata);
+    }
+
+    for file in database.files() {
+        if !stub_file_ids.contains(&file.id) || skip_file_id == Some(file.id) {
+            continue;
+        }
+
+        let arena = Bump::new();
+        let program = parse_file_with_settings(&arena, &file, parser_settings);
+        let resolved_names = NameResolver::new(&arena).resolve(program);
+        let mut metadata = scan_program(&arena, &file, program, &resolved_names);
+        metadata.mark_as_stub();
+        codebase.apply_stub_metadata(metadata);
+    }
+
+    codebase
+}
+
 /// The "reduce" step for the analysis pipeline.
 ///
 /// This struct aggregates the `AnalysisResult` from each parallel task into a single,
@@ -198,5 +263,131 @@ impl Reducer<AnalysisResult, AnalysisResult> for AnalysisResultReducer {
         aggregated_result.issues.extend(codebase.take_issues(true));
 
         Ok(aggregated_result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::path::Path;
+    use std::sync::LazyLock;
+
+    use mago_analyzer::plugin::PluginRegistry;
+    use mago_database::Database;
+    use mago_database::DatabaseConfiguration;
+    use mago_database::file::File;
+    use mago_database::file::FileType;
+
+    use super::*;
+
+    static PLUGIN_REGISTRY: LazyLock<Arc<PluginRegistry>> =
+        LazyLock::new(|| Arc::new(PluginRegistry::with_library_providers()));
+
+    #[test]
+    fn stub_files_patch_existing_definitions_during_analysis() {
+        let config = DatabaseConfiguration {
+            workspace: Cow::Owned(Path::new("/test").to_path_buf()),
+            paths: vec![Cow::Borrowed("src")],
+            includes: vec![Cow::Borrowed("stubs")],
+            excludes: vec![],
+            extensions: vec![Cow::Borrowed("php")],
+        };
+
+        let mut database = Database::new(config);
+        database.add(File::new(
+            Cow::Borrowed("src/datetime.php"),
+            FileType::Host,
+            None,
+            Cow::Borrowed("<?php\ninterface DateTimeInterface {}\n"),
+        ));
+        database.add(File::new(
+            Cow::Borrowed("src/main.php"),
+            FileType::Host,
+            None,
+            Cow::Borrowed(
+                "<?php\nclass Foo {\n    public function __call(string $name, array $arguments): mixed { return 1; }\n}\nfunction demo(Foo $foo): int {\n    return $foo->magic();\n}\n",
+            ),
+        ));
+        database.add(File::new(
+            Cow::Borrowed("stubs/foo.stub.php"),
+            FileType::Vendored,
+            None,
+            Cow::Borrowed("<?php\n/** @method int magic() */\nclass Foo {}\n"),
+        ));
+
+        let service = AnalysisService::new(
+            database.read_only(),
+            CodebaseMetadata::new(),
+            SymbolReferences::new(),
+            Settings::default(),
+            ParserSettings::default(),
+            false,
+            Arc::clone(&PLUGIN_REGISTRY),
+            Path::new("/test").to_path_buf(),
+            vec!["stubs/foo.stub.php".to_string()],
+            vec![".stub".to_string()],
+        );
+
+        let result = service.run().expect("analysis should succeed");
+        assert!(
+            result.issues.is_empty(),
+            "stub file should provide the missing magic method type: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn stub_files_patch_declared_methods_on_existing_interfaces() {
+        let config = DatabaseConfiguration {
+            workspace: Cow::Owned(Path::new("/test").to_path_buf()),
+            paths: vec![Cow::Borrowed("src")],
+            includes: vec![Cow::Borrowed("stubs")],
+            excludes: vec![],
+            extensions: vec![Cow::Borrowed("php")],
+        };
+
+        let mut database = Database::new(config);
+        database.add(File::new(
+            Cow::Borrowed("src/datetime.php"),
+            FileType::Host,
+            None,
+            Cow::Borrowed("<?php\ninterface DateTimeInterface {}\n"),
+        ));
+        database.add(File::new(
+            Cow::Borrowed("src/main.php"),
+            FileType::Host,
+            None,
+            Cow::Borrowed(
+                "<?php\nfunction update(DateTimeInterface $date): DateTimeInterface {\n    return $date->modify('+1 day');\n}\n",
+            ),
+        ));
+        database.add(File::new(
+            Cow::Borrowed("stubs/DateTimeInterface.phpstub"),
+            FileType::Vendored,
+            None,
+            Cow::Borrowed(
+                "<?php\ninterface DateTimeInterface {\n    /** @return $this */\n    public function modify(string $modifier): static;\n}\n",
+            ),
+        ));
+
+        let service = AnalysisService::new(
+            database.read_only(),
+            CodebaseMetadata::new(),
+            SymbolReferences::new(),
+            Settings::default(),
+            ParserSettings::default(),
+            false,
+            Arc::clone(&PLUGIN_REGISTRY),
+            Path::new("/test").to_path_buf(),
+            vec!["stubs/DateTimeInterface.phpstub".to_string()],
+            vec![".stub".to_string()],
+        );
+
+        let result = service.run().expect("analysis should succeed");
+        assert!(
+            result.issues.is_empty(),
+            "stub file should patch the declared interface method: {:?}",
+            result.issues
+        );
     }
 }
