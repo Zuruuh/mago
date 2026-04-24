@@ -128,6 +128,7 @@ use crate::rule::NoUnsafeFinallyConfig;
 use crate::rule::NoVariableVariableConfig;
 use crate::rule::NoVoidReferenceReturnConfig;
 use crate::rule::OptionalParamOrderConfig;
+use crate::rule::OrderedAttributesConfig;
 use crate::rule::PreferAnonymousMigrationConfig;
 use crate::rule::PreferArrowFunctionConfig;
 use crate::rule::PreferEarlyContinueConfig;
@@ -239,6 +240,7 @@ pub struct RulesSettings {
     pub no_shorthand_ternary: RuleSettings<NoShorthandTernaryConfig>,
     pub no_sprintf_concat: RuleSettings<NoSprintfConcatConfig>,
     pub optional_param_order: RuleSettings<OptionalParamOrderConfig>,
+    pub ordered_attributes: RuleSettings<OrderedAttributesConfig>,
     pub deprecated_cast: RuleSettings<DeprecatedCastConfig>,
     pub deprecated_shell_execute_string: RuleSettings<DeprecatedShellExecuteStringConfig>,
     pub deprecated_switch_semicolon: RuleSettings<DeprecatedSwitchSemicolonConfig>,
